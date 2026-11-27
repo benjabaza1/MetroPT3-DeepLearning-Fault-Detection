@@ -1,0 +1,16 @@
+{
+    "modelo": "CNN1D_Base",
+    "parametros": 9793,
+    "epocas": 8,
+    "average_precision": 0.9839802349220671,
+    "f1_umbral_05": 0.9776247848537005,
+    "umbral_ajustado": 0.9329351186752319,
+    "precision_ajustada": 0.9726027397260274,
+    "recall_ajustado": 0.9895470383275261,
+    "f1_ajustado": 0.9810017271157168,
+    "TN": 3286,
+    "FP": 8,
+    "FN": 3,
+    "TP": 284,
+    "semilla": 42
+}

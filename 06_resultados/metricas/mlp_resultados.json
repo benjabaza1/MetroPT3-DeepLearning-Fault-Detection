@@ -1,0 +1,19 @@
+{
+    "modelo": "MLP_Base",
+    "capas_ocultas": [
+        64,
+        32
+    ],
+    "activacion": "relu",
+    "learning_rate": 0.001,
+    "batch_size": 128,
+    "epocas_ejecutadas": 10,
+    "average_precision_val": 0.9600652918191058,
+    "mejor_umbral_val": 0.007070175837725401,
+    "mejor_f1_val": 0.9742710119568729,
+    "pesos_clase": {
+        "0": 0.5064981433876036,
+        "1": 38.972527472527474
+    },
+    "semilla": 42
+}

@@ -1,0 +1,16 @@
+{
+    "modelo": "LSTM_Base",
+    "parametros": 6689,
+    "epocas": 12,
+    "average_precision": 0.9987988673814606,
+    "f1_umbral_05": 0.9845094664371773,
+    "umbral_ajustado": 0.6298224925994873,
+    "precision_ajustada": 0.9794520547945206,
+    "recall_ajustado": 0.9965156794425087,
+    "f1_ajustado": 0.9879101899827288,
+    "TN": 3288,
+    "FP": 6,
+    "FN": 1,
+    "TP": 286,
+    "semilla": 42
+}

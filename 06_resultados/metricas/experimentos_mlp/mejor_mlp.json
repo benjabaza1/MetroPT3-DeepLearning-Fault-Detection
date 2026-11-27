@@ -1,0 +1,20 @@
+{
+    "modelo": "MLP_04_Tanh",
+    "capas": "[64, 32]",
+    "activacion": "tanh",
+    "dropout": 0.0,
+    "parametros": 59777,
+    "epocas": 16,
+    "average_precision": 0.9974254886990367,
+    "f1_umbral_05": 0.9759450171821306,
+    "umbral_ajustado": 0.9829450249671936,
+    "precision_ajustada": 0.9826989619377162,
+    "recall_ajustado": 0.9895470383275261,
+    "f1_ajustado": 0.9861111111111112,
+    "TN": 3289,
+    "FP": 5,
+    "FN": 3,
+    "TP": 284,
+    "loss_train_sin_pesos": 0.061505839228630066,
+    "loss_val_sin_pesos": 0.014336659573018551
+}

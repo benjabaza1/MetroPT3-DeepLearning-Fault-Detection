@@ -1,0 +1,787 @@
+---
+title: "Detección de fallas industriales mediante aprendizaje profundo"
+subtitle: "Portafolio de clasificación · Dataset MetroPT-3 · MLP, CNN 1D y LSTM"
+author: "Benjamín Wilson Baza Paredes"
+date: "2026-11-24"
+lang: es
+format:
+  html:
+    theme: cosmo
+    page-layout: article
+    code-tools: true
+    mainfont: "Arial"
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: false
+    code-summary: "Código Python"
+    embed-resources: true
+    fig-responsive: true
+    smooth-scroll: true
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: python3
+---
+
+```{python}
+#| label: setup
+#| echo: false
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from IPython.display import display, Markdown
+
+# Este archivo se guarda en 08_portafolio/portafolio_metropt3.qmd.
+# Quarto ejecuta normalmente los bloques desde la carpeta del archivo.
+# Se admiten ambas ubicaciones de trabajo para evitar errores con VS Code.
+cwd = Path.cwd()
+if (cwd / 'datos' / '15_experimentos.csv').exists():
+    PORTAFOLIO = cwd
+elif (cwd / '08_portafolio' / 'datos' / '15_experimentos.csv').exists():
+    PORTAFOLIO = cwd / '08_portafolio'
+else:
+    raise FileNotFoundError(
+        f'No se encuentra 15_experimentos.csv. Directorio actual: {cwd}. '
+        'Ejecuta primero 08_portafolio/01_consolidar_resultados.py.'
+    )
+DATOS = PORTAFOLIO / 'datos'
+RAIZ = PORTAFOLIO.parent
+RES = RAIZ / '06_resultados'
+
+experimentos = pd.read_csv(DATOS / '15_experimentos.csv')
+prueba = pd.read_csv(DATOS / 'evaluacion_test.csv')
+ablacion = pd.read_csv(DATOS / 'ablacion.csv')
+importancias = pd.read_csv(DATOS / 'importancia_sensores.csv')
+auditoria = pd.read_csv(DATOS / 'auditoria_estados.csv')
+assert len(experimentos) == 15
+assert len(prueba) == 3
+assert len(ablacion) == 3
+assert len(importancias) == 45
+
+plt.rcParams['figure.dpi'] = 120
+pd.options.display.float_format = '{:.4f}'.format
+plt.rcParams.update({'axes.spines.top':False, 'axes.spines.right':False,
+                     'axes.titlesize':13, 'axes.labelsize':11,
+                     'figure.figsize':(10, 5.5)})
+# Los CSV de historiales y predicciones se leen cuando son necesarios.
+RUTAS_HISTORIALES = {
+    'MLP': RES / 'metricas' / 'experimentos_mlp',
+    'CNN 1D': RES / 'metricas' / 'experimentos_cnn',
+    'LSTM': RES / 'metricas' / 'experimentos_lstm',
+}
+RUTA_TEST = RES / 'metricas' / 'evaluacion_final'
+
+
+def tabla(df, decimales=4):
+    display(Markdown(df.to_markdown(index=False, floatfmt=f'.{decimales}f')))
+
+# Función para mostrar gráficos previamente generados si existen.
+def mostrar_imagen(ruta, titulo=None):
+    from IPython.display import Image
+    if ruta.exists():
+        if titulo:
+            display(Markdown(f'**{titulo}**'))
+        display(Image(filename=str(ruta)))
+    else:
+        print(f'Gráfico no encontrado (opcional): {ruta.name}')
+```
+
+# Resumen ejecutivo
+
+Este portafolio documenta un estudio de **detección contemporánea de fallas** en un compresor industrial a partir del conjunto de datos real MetroPT-3. Se implementaron y compararon tres familias de redes neuronales —**Multi-Layer Perceptron (MLP)**, **Convolutional Neural Network 1D (CNN 1D)** y **Long Short-Term Memory (LSTM)**— mediante 15 configuraciones experimentales. El objetivo no es pronosticar una falla con anticipación, sino identificar ventanas temporales que coinciden con los intervalos de avería documentados.
+
+En validación temporal, las configuraciones seleccionadas alcanzaron Average Precision elevados; sin embargo, durante la prueba sobre un evento diferente **ninguna detectó las 26 ventanas de falla aplicando el umbral previamente fijado**. El análisis posterior identificó una dependencia elevada de la señal `DV_pressure`, que exhibe un comportamiento distinto en la cuarta falla. El resultado central es la brecha entre el rendimiento en validación y la generalización a una avería no vista.
+
+::: {.callout-note}
+## Interpretación responsable
+Los resultados son experimentales. La cantidad de ventanas no equivale a la cantidad de eventos independientes, y el sistema no está validado para operación industrial. La evaluación final de prueba original no fue utilizada para seleccionar las arquitecturas ni ajustar sus umbrales; las auditorías y ablaciones posteriores se identifican explícitamente como **exploratorias**.
+:::
+
+# Problema y objetivos
+
+## Contexto industrial
+
+El dataset MetroPT-3 contiene mediciones de un compresor de aire empleado en el sector ferroviario. Las señales abarcan presiones, temperatura, corriente de motor y estados digitales. Los intervalos de falla disponibles se corresponden con cuatro eventos documentados de fugas de aire.
+
+## Objetivo general
+
+Comparar la capacidad de MLP, CNN 1D y LSTM para clasificar ventanas temporales de operación normal y de falla mediante una evaluación cronológica, analizando sus limitaciones de generalización y la influencia de las variables de entrada.
+
+## Objetivos específicos
+
+1. Explorar y preparar registros temporales reales y etiquetar las fallas conforme a los intervalos documentados.
+2. Construir ventanas multivariadas y aplicar normalización ajustada exclusivamente al entrenamiento.
+3. Entrenar cinco configuraciones de cada familia de redes neuronales y seleccionar una por Average Precision de validación.
+4. Evaluar los modelos seleccionados sobre un evento temporal reservado.
+5. Analizar las puntuaciones, la importancia de variables, los estados operacionales y una ablación posterior de `DV_pressure`.
+
+# Antes de comenzar: ¿qué estamos intentando detectar?
+
+## La máquina, el problema y nuestra pregunta
+
+Imagina un **compresor de aire de un tren**. Su trabajo es comprimir y mantener aire a presión para distintos sistemas. Igual que un neumático pierde aire si tiene una fuga, una parte del sistema del compresor puede presentar una **fuga de aire**. En los datos de MetroPT-3 existen **cuatro intervalos de tiempo documentados como fallas** asociados a fugas.
+
+**Nuestro trabajo consiste en leer las señales del compresor y decidir si un período de funcionamiento coincide con uno de esos intervalos de falla.** No buscamos averiguar cuál pieza exacta se rompió ni predecir cuántas horas faltan para la próxima fuga. Estamos haciendo **detección**, no pronóstico anticipado ni diagnóstico de componentes.
+
+| Pregunta | Respuesta concreta de nuestro proyecto |
+|:--|:--|
+| **¿Qué recibe la red?** | Lecturas de **15 sensores y estados** durante **60 registros seguidos**. |
+| **¿Qué le enseñamos?** | Ejemplos de períodos etiquetados como **normales (0)** o **dentro de un evento de falla (1)**. |
+| **¿Qué debe responder?** | Una **puntuación** que, comparada con un límite, produce «normal» o «falla». |
+| **¿Qué fallas buscamos?** | Las **fugas de aire** documentadas en cuatro intervalos; no todas las averías posibles. |
+| **¿Qué NO puede afirmar el modelo?** | No demuestra la causa mecánica, la pieza dañada ni cuánto tiempo falta para una falla futura. |
+
+## Así funciona todo el proyecto, de principio a fin
+
+```{mermaid}
+flowchart TD
+    A[Compresor: produce lecturas de sensores] --> B[Reunimos 60 registros consecutivos]
+    B --> C[Una ventana con 15 valores en cada registro]
+    C --> D[La red analiza los valores de la ventana]
+    D --> E[Entrega una puntuación entre 0 y 1]
+    E --> F{¿Alcanza el límite de decisión?}
+    F -->|Sí| G[Resultado: Falla]
+    F -->|No| H[Resultado: Normal]
+```
+
+**Ejemplo inventado solo para entender la idea:** si un modelo entrega **0,70** y su límite de decisión fuera **0,60**, respondería «falla». Si entrega **0,20**, respondería «normal». Los límites verdaderos de nuestros modelos son distintos y fueron elegidos durante la validación.
+
+# Entendamos los datos sin tecnicismos
+
+## ¿Qué significa una lectura o registro?
+
+En un instante determinado, la máquina informa cosas como: «cuánta presión hay», «qué temperatura tiene el aceite» y «qué válvula está activada». **Una fila del dataset es una fotografía numérica del estado del compresor en ese momento**.
+
+Un sensor de presión podría informar un valor como **2,0**; una señal de válvula podría informar **1**. Ambos son números, pero **no significan lo mismo**. El primero expresa una magnitud medida; el segundo indica un estado codificado.
+
+## ¿Qué es una señal continua y qué es una señal digital?
+
+| Tipo | Explicación sencilla | Ejemplo ilustrativo |
+|:--|:--|:--|
+| **Continua** | Informa **cuánto** mide algo: puede variar entre muchos valores. | Temperatura del aceite = 60,5; presión = 2,1. |
+| **Digital** | Informa el **estado** de una señal o componente, normalmente mediante **0 y 1**. | `COMP = 0` o `COMP = 1`. |
+
+**¡Importante!** En un sensor digital, **1 NO significa que hay una falla**, ni 0 significa automáticamente que la máquina está bien. Representan estados de esa señal; para interpretar con certeza qué significa activada o desactivada hay que consultar la descripción del sensor. **La etiqueta de falla es otra columna distinta**, construida a partir de las fechas de las averías documentadas.
+
+En nuestro análisis, `COMP`, `DV_eletric` y `MPG` son ejemplos de señales digitales. Durante las cuatro fallas, frecuentemente observamos `COMP = 0`, `DV_eletric = 1` y `MPG = 0`; pero **esa combinación también puede aparecer durante funcionamiento normal**. Por eso no equivale a un diagnóstico por sí sola.
+
+## Los 15 sensores: ¿qué información entregan?
+
+| Sensor | Tipo | Forma sencilla de entenderlo |
+|:--|:--|:--|
+| `TP2` | Continua | Presión medida en un punto del circuito. |
+| `TP3` | Continua | Presión en otra parte del circuito. |
+| `H1` | Continua | Otra medición de presión del sistema. |
+| `DV_pressure` | Continua | Presión relacionada con la descarga de los secadores; fue muy importante en nuestros modelos. |
+| `Reservoirs` | Continua | Presión de los depósitos o reservorios de aire. |
+| `Oil_temperature` | Continua | Temperatura del aceite. |
+| `Motor_current` | Continua | Corriente eléctrica del motor, útil para observar su actividad. |
+| `COMP` | Digital | Señal de estado de una válvula/componente del compresor. |
+| `DV_eletric` | Digital | Estado eléctrico asociado a la válvula de descarga. |
+| `Towers` | Digital | Estado relacionado con las torres del sistema. |
+| `MPG` | Digital | Señal de un control del sistema. |
+| `LPS` | Digital | Señal de un interruptor/control de presión. |
+| `Pressure_switch` | Digital | Estado de un interruptor de presión. |
+| `Oil_level` | Digital | Estado relacionado con el nivel de aceite. |
+| `Caudal_impulses` | Digital | Señal de impulsos relacionada con el caudal. |
+
+*Esta es una interpretación introductoria; los nombres de variables no bastan para inferir por sí solos el estado físico exacto de cada componente.*
+
+## ¿Qué son 60 × 15, una matriz y un vector?
+
+Una **ventana** es simplemente un grupo de **60 filas seguidas**, y en cada una tenemos **15 valores**. Es como una tabla Excel con **60 filas y 15 columnas**. Eso se escribe «60 × 15».
+
+| Instante de la ventana | TP2 | TP3 | ... | DV_pressure | ... | COMP |
+|:--|--:|--:|:--:|--:|:--:|--:|
+| 1 | lectura | lectura | ... | lectura | ... | 0 o 1 |
+| 2 | lectura | lectura | ... | lectura | ... | 0 o 1 |
+| ... | ... | ... | ... | ... | ... | ... |
+| 60 | lectura | lectura | ... | lectura | ... | 0 o 1 |
+
+- **Matriz:** otra manera de llamar a esa tabla de filas y columnas.
+- **Vector:** una lista de números colocados en una sola fila larga.
+- **Aplanar:** tomar todos los valores de la tabla y ponerlos en una lista. **60 × 15 = 900 valores**. No son 900 sensores: son **15 sensores medidos 60 veces**.
+
+La **MLP** utiliza la lista de 900 valores. **CNN 1D y LSTM** conservan la tabla de 60 filas y 15 columnas. Las tres reciben la misma información; lo que cambia es **cómo la recorren y combinan**.
+
+```{mermaid}
+flowchart TD
+    A[Una ventana: 60 filas y 15 columnas] --> B{¿Cómo la procesa la red?}
+    B --> C[MLP: junta todo en una lista de 900 números]
+    B --> D[CNN 1D: busca cambios en grupos de instantes cercanos]
+    B --> E[LSTM: revisa los instantes en orden y conserva información]
+    C --> F[Una puntuación final]
+    D --> F
+    E --> F
+```
+
+## Una ventana real de nuestro proyecto, dibujada
+
+El siguiente gráfico toma **una ventana real de entrenamiento** si las matrices están disponibles. Sirve para reconocer cómo se ve una entrada: 60 instantes y varios sensores. Las señales continuas ya están normalizadas y por eso no corresponden a las unidades físicas originales.
+
+```{python}
+#| label: fig-ejemplo-ventana
+#| fig-cap: "Ejemplo real de una ventana de 60 instantes: cuatro señales de entrada ya preparadas"
+archivo_ventanas = RAIZ / '01_datos' / 'procesados' / 'X_train.npy'
+if archivo_ventanas.exists():
+    Xej = np.load(archivo_ventanas, mmap_mode='r')
+    nombres_ej = ['TP2','TP3','H1','DV_pressure','Reservoirs',
+                 'Oil_temperature','Motor_current','COMP','DV_eletric',
+                 'Towers','MPG','LPS','Pressure_switch','Oil_level','Caudal_impulses']
+    ind = [0, 3, 6, 8]
+    fig, axs = plt.subplots(4, 1, figsize=(9, 7), sharex=True)
+    for ax, j in zip(axs, ind):
+        ax.plot(np.arange(1,61), Xej[0,:,j], linewidth=1.6)
+        ax.set_ylabel(nombres_ej[j], rotation=0, ha='right', va='center')
+        ax.grid(alpha=.17)
+    axs[-1].set_xlabel('Instante dentro de la ventana (1 a 60)')
+    plt.tight_layout(); plt.show()
+else:
+    print('La matriz de entrenamiento no está presente; se omite este gráfico opcional.')
+```
+
+**Cómo explicarlo:** «Cada curva corresponde a un sensor. La red observa varias curvas a la vez, no una única lectura. Así intenta distinguir qué patrones se asocian con una ventana normal o de falla».
+
+## ¿Cómo sabemos cuándo hubo una falla?
+
+No fue la red la que inventó las fechas de las fallas. **Partimos de cuatro intervalos de fuga de aire documentados**. Marcamos con **1** las mediciones dentro de esos intervalos y con **0** las demás. Luego construimos ventanas con esas etiquetas.
+
+En otras palabras, **primero sabemos qué ejemplos son normales y cuáles corresponden a fallas documentadas; después entrenamos la red para que aprenda diferencias entre sus sensores**. Un límite importante es que una etiqueta de todo un intervalo no garantiza que cada segundo tenga el mismo patrón físico de fuga.
+
+## Lo que descubrimos sobre la cuarta falla
+
+Las fallas 1, 2 y 3 mostraban valores de `DV_pressure` cercanos a **2** en promedio; la falla 4 mostró valores alrededor de **−0,009**, muy parecidos a muchos períodos normales. Las tres redes habían utilizado mucho esa señal. Por eso, **es plausible que hayan aprendido una pista útil para las fallas conocidas que no se repitió en la cuarta**.
+
+No significa que la cuarta falla fuera falsa ni que `DV_pressure` causara la avería. Significa que **los cuatro eventos de fuga no compartían necesariamente la misma señal distintiva**.
+
+# Datos y preparación temporal
+
+## Origen del conjunto de datos y variables
+
+Se trabajó con **1.516.948 observaciones originales** y **15 señales de sensores**, más la marca de tiempo. Se utilizaron siete señales numéricas continuas y ocho estados digitales. La indexación adicional del archivo bruto no se considera variable predictora.
+
+| Señal continua | Señal digital |
+|:--|:--|
+| TP2 | COMP |
+| TP3 | DV_eletric |
+| H1 | Towers |
+| DV_pressure | MPG |
+| Reservoirs | LPS |
+| Oil_temperature | Pressure_switch |
+| Motor_current | Oil_level, Caudal_impulses |
+
+Fuente pública: [MetroPT-3, UCI Machine Learning Repository](https://archive.ics.uci.edu/dataset/791/metropt+3+dataset), DOI [10.24432/C5VW3R](https://doi.org/10.24432/C5VW3R). El repositorio describe 1.516.948 filas, 15 señales y los intervalos de fugas utilizados para el etiquetado.
+
+## ¿Qué representa físicamente cada grupo de sensores?
+
+Las señales **TP2, TP3, H1, DV_pressure y Reservoirs** describen presiones asociadas a distintas partes del circuito; **Oil_temperature** describe la temperatura de aceite y **Motor_current**, la corriente del motor. Los estados digitales (como **COMP**, **DV_eletric** y **MPG**) reflejan condiciones o controles del equipo. No deben confundirse: **un estado eléctrico activado no equivale a una fuga**, y una presión elevada puede depender también del modo operativo.
+
+## Etiquetado y unidad experimental
+
+Se asignó la etiqueta positiva a las observaciones ubicadas dentro de los cuatro intervalos de falla informados en la documentación de origen; las demás se consideraron normales. Por lo tanto, las etiquetas se basan en **intervalos de eventos**, no en un diagnóstico independiente por cada fila.
+
+Las entradas de las redes son ventanas de **60 pasos temporales × 15 sensores**. Se descartaron ventanas que cruzaban límites de eventos, que contenían discontinuidades temporales importantes o que infringían los criterios de integridad implementados. Las ventanas no se solapan.
+
+## Separación cronológica
+
+| Conjunto | Ventanas | Normales | Falla | Eventos positivos |
+|:--|--:|--:|--:|:--|
+| Entrenamiento | 14.186 | 14.004 | 182 | Fallas 1 y 2 |
+| Validación | 3.581 | 3.294 | 287 | Falla 3 |
+| Prueba | 7.335 | 7.309 | 26 | Falla 4 |
+
+La normalización de las señales continuas se ajustó únicamente usando las observaciones seleccionadas del conjunto de entrenamiento. Las señales digitales conservaron su codificación. Este diseño reduce la fuga de información entre particiones. La prevalencia de fallas varía sustancialmente entre los conjuntos; ello obliga a interpretar con cautela las métricas y sus diferencias.
+
+### Verificación reproducible de las ventanas
+
+El siguiente código **lee las matrices realmente preparadas**, verifica cuántas ventanas corresponden a cada clase y confirma que cada muestra conserva 60 instantes y 15 señales. No vuelve a entrenar redes ni modifica los datos.
+
+```{python}
+#| label: verificar-ventanas
+#| echo: true
+ARCHIVOS = RAIZ / '01_datos' / 'procesados'
+particiones = [
+    ('Entrenamiento', 'train'),
+    ('Validación', 'validation'),
+    ('Prueba', 'test'),
+]
+filas = []
+for nombre, sufijo in particiones:
+    X = np.load(ARCHIVOS / f'X_{sufijo}.npy', mmap_mode='r')
+    y = np.load(ARCHIVOS / f'y_{sufijo}.npy')
+    assert X.shape[1:] == (60, 15), f'Forma inesperada: {X.shape}'
+    assert len(X) == len(y)
+    filas.append({
+        'Conjunto': nombre, 'Ventanas': len(y),
+        'Normales': int(np.sum(y == 0)),
+        'Falla': int(np.sum(y == 1)),
+    })
+tabla(pd.DataFrame(filas), 0)
+```
+
+### Código clave de preparación
+
+Una ventana agrupa 60 registros consecutivos. En el procesamiento original también se comprobó que no cruzara eventos ni discontinuidades y se aplicó un embargo temporal entre particiones. El fragmento siguiente **ilustra la operación de agrupar mediciones**; los filtros de integridad completos están en `03_preprocesamiento/`.
+
+```{python}
+#| label: ejemplo-ventana
+#| echo: true
+# Extraemos una ventana ya validada para mostrar su estructura.
+ventana_ejemplo = np.load(
+    ARCHIVOS / 'X_train.npy', mmap_mode='r'
+)[0]
+print('Filas temporales:', ventana_ejemplo.shape[0])
+print('Sensores por fila:', ventana_ejemplo.shape[1])
+print('Valores en una ventana:', ventana_ejemplo.size)
+```
+
+
+# Guía para entender los conceptos y resultados
+
+## De una medición a una predicción
+
+Un **registro** representa una lectura instantánea de los sensores. Una **ventana** contiene 60 registros consecutivos y sus 15 variables; la red aprende a clasificar esa ventana como normal (clase 0) o coincidente con un intervalo documentado de falla (clase 1). No estamos prediciendo cuántas horas faltan para que ocurra una avería.
+
+```{mermaid}
+flowchart LR
+    A[Mediciones del compresor] --> B[Ordenar por fecha y etiquetar eventos]
+    B --> C[Ventanas de 60 pasos y 15 sensores]
+    C --> D[Normalizar con estadísticas de entrenamiento]
+    D --> E{Familia neuronal}
+    E --> F[MLP]
+    E --> G[CNN 1D]
+    E --> H[LSTM]
+    F --> I[Puntuación de falla: 0 a 1]
+    G --> I
+    H --> I
+    I --> J{¿Supera el umbral fijado?}
+    J -->|Sí| K[Clasificar como falla]
+    J -->|No| L[Clasificar como normal]
+```
+
+**Cómo leerlo:** la entrada es la misma para las tres familias y cambia únicamente el modo en que procesan la secuencia. La salida es **un puntaje entre 0 y 1**. La operación final se llama «sigmoide», y más adelante se explica con un ejemplo. Ese puntaje **no es necesariamente una probabilidad calibrada**.
+
+## Diccionario de las métricas
+
+| Concepto | Significado | Interpretación para este trabajo |
+|:--|:--|:--|
+| **Época** | Una pasada completa por las ventanas de entrenamiento | 12 épocas no significan 12 capas ni 12 modelos |
+| **Batch o lote** | Número de ventanas procesadas antes de una actualización | Se utilizó tamaño de lote 128 |
+| **Parámetros** | Pesos y sesgos que aprende la red | Más parámetros no garantizan mayor rendimiento |
+| **Binary cross-entropy** | Función de pérdida que penaliza puntuaciones incorrectas | Menor pérdida suele ser mejor, pero hay que observar validación |
+| **Adam** | Algoritmo que actualiza pesos utilizando gradientes | La tasa de aprendizaje utilizada fue 0,001 |
+| **Early stopping** | Detiene el entrenamiento si deja de mejorar la métrica monitoreada | Se supervisó PR-AUC de validación con paciencia de 7 épocas |
+| **Umbral** | Valor a partir del cual la puntuación pasa a clase falla | Se ajustó en validación y se congeló antes del test |
+| **AP (Average Precision)** | Resumen de la curva precisión–recall al variar el umbral | Métrica principal para comparar capacidad de ordenamiento |
+| **Precisión** | De las alarmas emitidas, cuántas correspondían a fallas | Permite cuantificar falsas alarmas |
+| **Recall o sensibilidad** | De las fallas reales, cuántas fueron detectadas | Crítico cuando interesa evitar fallas no detectadas |
+| **F1-score** | Media armónica de precisión y recall | Penaliza resultados desequilibrados entre ambas métricas |
+| **Exactitud (accuracy)** | Fracción total de clasificaciones acertadas | Puede resultar engañosa porque casi todo es normal |
+
+## Matriz de confusión: qué representa cada casilla
+
+| | Predicción normal (0) | Predicción falla (1) |
+|:--|:--|:--|
+| **Real normal (0)** | Verdadero negativo (VN): operación normal bien reconocida | Falso positivo (FP): alarma falsa |
+| **Real falla (1)** | Falso negativo (FN): falla no detectada | Verdadero positivo (VP): falla correctamente detectada |
+
+$$\mathrm{Precisión}=\frac{VP}{VP+FP},\quad \mathrm{Recall}=\frac{VP}{VP+FN},\quad F1=2\frac{\mathrm{Precisión}\cdot\mathrm{Recall}}{\mathrm{Precisión}+\mathrm{Recall}}$$
+
+**Ejemplo aplicado:** si existen 26 ventanas de falla y el modelo no detecta ninguna, el recall es $0/26=0\%$, aunque reconozca casi todas las ventanas normales.
+
+::: {.callout-note}
+## AP no equivale a porcentaje de fallas detectadas
+Un AP de **0,9988** no significa que el modelo detectó el 99,88 % de los eventos. AP mide ordenamiento a través de distintos umbrales, mientras que el recall final depende del **umbral congelado**. Los dos pueden ser muy distintos, como ocurrió en la prueba.
+:::
+
+## ¿Por qué usamos tres particiones?
+
+```{mermaid}
+flowchart LR
+    A[Entrenamiento: fallas 1 y 2] -->|Aprender pesos| B[Modelos candidatos]
+    B -->|Comparar y seleccionar| C[Validación: falla 3]
+    C -->|Congelar arquitectura y umbral| D[Prueba: falla 4]
+    D --> E[Evaluación final sin reajuste]
+```
+
+El criterio es **cronológico**: entrenamos en un período anterior, seleccionamos con uno posterior y evaluamos al final sobre un evento no utilizado. El gran límite es que cada partición contiene pocos **eventos independientes**, aunque tenga miles de ventanas.
+
+```{python}
+#| label: fig-proporciones
+#| fig-cap: "Proporción de ventanas positivas por conjunto: se compara en porcentaje para que la clase minoritaria sea visible"
+part = pd.DataFrame({'Conjunto':['Entrenamiento','Validación','Prueba'],
+ 'Normales':[14004,3294,7309], 'Falla':[182,287,26]})
+part['Porcentaje falla'] = 100*part['Falla']/(part['Normales']+part['Falla'])
+fig, ax=plt.subplots(figsize=(9,4.3))
+bars=ax.bar(part['Conjunto'],part['Porcentaje falla'])
+for b,v in zip(bars,part['Porcentaje falla']):
+ ax.text(b.get_x()+b.get_width()/2,v+.15,f'{v:.2f} %',ha='center',fontsize=11)
+ax.set_ylim(0,max(part['Porcentaje falla'])*1.2)
+ax.set_ylabel('Ventanas de falla (%)'); ax.grid(axis='y',alpha=.2)
+plt.show()
+```
+
+La clase falla corresponde aproximadamente al **1,28 %** en entrenamiento, al **8,01 %** en validación y al **0,35 %** en prueba. Comparar únicamente la exactitud sería engañoso: un clasificador que responda siempre «normal» puede alcanzar cerca del 99,65 % de exactitud en el test y **no detectar ninguna falla**.
+
+# Arquitecturas y metodología de entrenamiento
+
+## Cómo funciona cada arquitectura
+
+### MLP: red neuronal multicapa
+
+**Piénsalo como una persona que recibe una hoja con los 900 números y busca combinaciones que reconozca.** No recorre primero el segundo 1 y después el 2: recibe la lista completa.
+
+La **MLP (perceptrón multicapa)** transforma una ventana de $60\times15$ en un vector de **900 valores** (*Flatten*). Cada neurona de una capa densa combina todas las salidas de la capa anterior mediante pesos, un sesgo y una activación. El orden temporal no se elimina del vector, pero la red **no incorpora por diseño la vecindad entre instantes**.
+
+```{mermaid}
+flowchart TD
+    A[Tabla de 60 instantes con 15 sensores] --> B[Ordenar sus 900 números en una lista]
+    B --> C[Primera capa: combina la información]
+    C --> D[Segunda capa: combina lo aprendido]
+    D --> E[Entrega un puntaje de falla entre 0 y 1]
+    E --> F[Compara el puntaje con el límite: normal o falla]
+```
+
+
+
+### CNN 1D: convoluciones temporales
+
+**Piénsala como una lupa que se desplaza por los 60 instantes**. Busca pequeños patrones repetidos, por ejemplo que una presión suba durante varios registros cercanos. No sabemos de antemano qué patrón aprendió; es una analogía de cómo funciona el filtro.
+
+Una **CNN 1D** mantiene la forma $60\times15$. Los filtros convolucionales recorren la secuencia y **reutilizan los mismos pesos** en distintos instantes: aprenden patrones locales, por ejemplo cambios de varios sensores durante un intervalo corto. Un filtro de tamaño 3 considera tres posiciones consecutivas; uno de tamaño 5 considera cinco.
+
+```{mermaid}
+flowchart TD
+    A[Tabla con 60 instantes y 15 sensores] --> B[Filtros: detectan patrones en instantes cercanos]
+    B --> C[Reducir: conservar las señales más destacadas]
+    C --> D[Más filtros: combinar patrones]
+    D --> E[Resumir y combinar lo detectado]
+    E --> F[Entregar puntaje de falla entre 0 y 1]
+```
+
+**Qué hace cada bloque:** la convolución extrae patrones locales; el *MaxPooling* reduce la resolución temporal; el *GlobalAveragePooling* resume la activación de cada filtro; la capa Dense combina esas características. El promedio global puede perder la ubicación exacta de algunos patrones.
+
+
+A diferencia de MLP, la CNN aprende detectores de patrones que comparte a lo largo de la secuencia. Eso reduce el número de parámetros y favorece el reconocimiento de cambios temporales locales, pero no garantiza captar dependencias largas ni generalizar a nuevas fallas.
+
+### LSTM: memoria temporal recurrente
+
+**Piénsala como una persona que lee un relato en orden y va recordando lo relevante**. Cada nueva lectura puede reforzar o modificar lo que recuerda de instantes anteriores.
+
+Una **LSTM** recibe igualmente $60\times15$, pero procesa los instantes **secuencialmente**. Su estado interno se actualiza mediante compuertas que deciden qué información olvidar, incorporar y exponer. Así puede representar relaciones entre mediciones alejadas dentro de la ventana.
+
+```{mermaid}
+flowchart TD
+    A[Lee los 15 sensores del primer instante] --> B[Actualiza lo que recuerda]
+    B --> C[Lee el siguiente instante]
+    C --> D[Conserva información útil y descarta otra]
+    D --> E[Repite hasta el instante 60]
+    E --> F[Combina su resumen de la secuencia]
+    F --> G[Entrega puntaje de falla entre 0 y 1]
+```
+
+La figura representa conceptualmente el recorrido temporal; **los mismos parámetros recurrentes se reutilizan en cada paso**, no se crean 60 capas LSTM diferentes. Las compuertas de olvido, entrada y salida son mecanismos internos de cada unidad.
+
+
+La LSTM mantiene un estado interno que incorpora el orden temporal. En esta comparación obtuvo el mayor AP de validación y de prueba, pero con el umbral definido no identificó ninguna de las 26 ventanas positivas de prueba.
+
+## Comparación visual: qué cambia entre las tres redes
+
+| Aspecto | MLP | CNN 1D | LSTM |
+|:--|:--|:--|:--|
+| **Entrada efectiva** | Vector 900 | Matriz 60 × 15 | Matriz 60 × 15 |
+| **Operación principal** | Multiplicaciones de capas densas | Filtros que recorren el tiempo | Actualizaciones recurrentes de estado |
+| **Tratamiento del tiempo** | Posiciones fijas sin estructura temporal incorporada | Vecindad local explícita | Orden y dependencias a través de estados |
+| **Reutilización de pesos** | No comparte pesos entre instantes | Comparte filtros entre instantes | Reutiliza pesos recurrentes en cada instante |
+| **Parámetros seleccionados** | 59.777 | 9.793 | 6.689 |
+| **Fortaleza teórica** | Línea base flexible | Patrones temporales locales | Dependencias temporales |
+| **Límite observado** | No detectó falla 4 | No detectó falla 4 | No detectó falla 4 |
+
+
+## Código de las tres arquitecturas
+
+Los diagramas anteriores describen el funcionamiento. Para verificar su implementación, este bloque construye las **tres configuraciones seleccionadas**, utilizando Keras y las mismas dimensiones del estudio. Cada una recibe una ventana, pero la procesa de manera distinta.
+
+```{python}
+#| label: codigo-arquitecturas
+#| echo: true
+import tensorflow as tf
+
+def construir_mlp():
+    return tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(900,)),
+        tf.keras.layers.Dense(64, activation='tanh'),
+        tf.keras.layers.Dense(32, activation='tanh'),
+        tf.keras.layers.Dense(1, activation='sigmoid')
+    ])
+
+def construir_cnn():
+    return tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(60, 15)),
+        tf.keras.layers.Conv1D(32, 3, padding='same', activation='tanh'),
+        tf.keras.layers.MaxPooling1D(2),
+        tf.keras.layers.Conv1D(64, 3, padding='same', activation='tanh'),
+        tf.keras.layers.GlobalAveragePooling1D(),
+        tf.keras.layers.Dense(32, activation='tanh'),
+        tf.keras.layers.Dense(1, activation='sigmoid')
+    ])
+
+def construir_lstm():
+    return tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(60, 15)),
+        tf.keras.layers.LSTM(32),
+        tf.keras.layers.Dense(16, activation='relu'),
+        tf.keras.layers.Dense(1, activation='sigmoid')
+    ])
+
+arquitecturas = {
+    'MLP': construir_mlp(),
+    'CNN 1D': construir_cnn(),
+    'LSTM': construir_lstm()
+}
+conteo = pd.DataFrame([
+    {'Modelo': nombre, 'Parámetros': modelo.count_params()}
+    for nombre, modelo in arquitecturas.items()
+])
+tabla(conteo, 0)
+```
+
+En la **MLP**, `Dense` combina todos los valores de la lista de 900 números. En la **CNN**, `Conv1D` mueve filtros por los instantes consecutivos y `MaxPooling1D` reduce su tamaño temporal. En la **LSTM**, la capa recurrente avanza por la secuencia conservando un estado interno. Finalmente, `sigmoid` produce un puntaje entre cero y uno; después se compara con un umbral definido en validación.
+
+## Cómo se entrenaron las redes
+
+Para las tres familias utilicé `binary_crossentropy` como función de pérdida, Adam para actualizar los pesos, **30 épocas como máximo**, lotes de 128 ventanas, semilla 42 y pesos de clase para compensar la escasez de fallas. La parada temprana recuperó los pesos de la época con mejor PR-AUC de validación. Cada familia tuvo **cinco configuraciones** con cambios en tamaño, profundidad, funciones de activación o filtros.
+
+Este bloque muestra la configuración de entrenamiento utilizada. **No vuelve a ejecutar las 15 pruebas**, ya que los resultados y pesos entrenados están guardados en el proyecto.
+
+```{python}
+#| label: codigo-configuracion-entrenamiento
+#| echo: true
+from sklearn.utils.class_weight import compute_class_weight
+
+y_ent = np.load(ARCHIVOS / 'y_train.npy')
+valores = compute_class_weight('balanced', classes=np.array([0, 1]), y=y_ent)
+pesos_clase = {0: float(valores[0]), 1: float(valores[1])}
+
+modelo_referencia = construir_lstm()
+modelo_referencia.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss='binary_crossentropy',
+    metrics=[tf.keras.metrics.AUC(curve='PR', name='pr_auc')]
+)
+parada_temprana = tf.keras.callbacks.EarlyStopping(
+    monitor='val_pr_auc', mode='max', patience=7, restore_best_weights=True
+)
+print('Pesos de clase:', pesos_clase)
+print('Máximo de épocas: 30 | Lote: 128 | Semilla: 42')
+# El entrenamiento real se ejecutó en los scripts de 05_experimentos/.
+# modelo_referencia.fit(X_train, y_ent, validation_data=(X_val, y_val),
+#                       epochs=30, batch_size=128, class_weight=pesos_clase,
+#                       callbacks=[parada_temprana])
+```
+
+# Resultados de los experimentos
+
+Se probaron 15 configuraciones: cinco MLP, cinco CNN 1D y cinco LSTM. En lugar de comparar solamente la exactitud, utilicé **Average Precision (AP)**: una medida de qué tan bien se ordenan las ventanas con falla por encima de las normales, considerando distintos límites de decisión. En esta métrica, cuanto mayor sea el resultado, mejor fue la separación para el conjunto evaluado.
+
+```{python}
+#| label: tabla-15-modelos-final
+#| echo: true
+# Tabla elaborada a partir de los resultados reales guardados por los scripts.
+columnas = ['familia', 'modelo', 'parametros', 'average_precision', 'f1_ajustado']
+tabla(experimentos[columnas].sort_values('average_precision', ascending=False)
+      .rename(columns={
+          'familia': 'Familia', 'modelo': 'Configuración',
+          'parametros': 'Parámetros', 'average_precision': 'AP validación',
+          'f1_ajustado': 'F1 validación'
+      }))
+```
+
+```{python}
+#| label: grafico-configuraciones-final
+#| fig-cap: 'Comparación del Average Precision de las cinco variantes de cada arquitectura'
+#| echo: true
+for familia in ['MLP', 'CNN 1D', 'LSTM']:
+    grupo = (experimentos.loc[experimentos.familia == familia]
+             .sort_values('average_precision'))
+    fig, ax = plt.subplots(figsize=(9, 3.5))
+    ax.barh(grupo['modelo'], grupo['average_precision'], color='#2473a6')
+    ax.set(xlabel='Average Precision en validación', title=f'Familia {familia}', xlim=(0, 1.05))
+    ax.grid(axis='x', alpha=.2)
+    plt.tight_layout()
+    plt.show()
+```
+
+La mejor configuración por familia fue **MLP_04_Tanh (AP 0,9974)**, **CNN_05_Tanh (AP 0,9889)** y **LSTM_01_Base (AP 0,9988)**. La LSTM obtuvo el mayor AP en validación con 6.689 parámetros; sin embargo, esta comparación corresponde a **una sola falla de validación**, no a múltiples fallas independientes.
+
+## Curvas de entrenamiento
+
+El gráfico de pérdida permite observar cómo cambió el error durante las épocas; el PR-AUC de Keras permite observar la calidad aproximada de la separación durante el entrenamiento. **No es idéntico al AP calculado posteriormente con scikit-learn.**
+
+```{python}
+#| label: grafico-entrenamiento-final
+#| fig-cap: 'Evolución del error de entrenamiento y validación para el mejor modelo de cada familia'
+#| echo: true
+mejores = (experimentos.sort_values('average_precision', ascending=False)
+           .drop_duplicates('familia'))
+for _, fila in mejores.iterrows():
+    familia, nombre = fila['familia'], fila['modelo']
+    carpeta = RUTAS_HISTORIALES[familia]
+    ruta = carpeta / f'{nombre}_historial.csv'
+    if not ruta.exists():
+        print(f'Historial no disponible: {ruta.name}')
+        continue
+    h = pd.read_csv(ruta)
+    if not {'loss', 'val_loss'}.issubset(h.columns):
+        print(f'Sin columnas de pérdida: {ruta.name}')
+        continue
+    fig, ax = plt.subplots(figsize=(8, 3.6))
+    ax.plot(np.arange(1, len(h)+1), h.loss, label='Entrenamiento')
+    ax.plot(np.arange(1, len(h)+1), h.val_loss, label='Validación')
+    ax.set(xlabel='Época', ylabel='Pérdida (error)', title=f'{familia}: {nombre}')
+    ax.legend(); ax.grid(alpha=.2)
+    plt.tight_layout(); plt.show()
+```
+
+# Evaluación final con datos no utilizados en entrenamiento
+
+Después de seleccionar un modelo por familia, se evaluó la **Falla 4**, que contiene 26 ventanas positivas dentro de las 7.335 ventanas de prueba. Los umbrales de decisión ya estaban fijados con validación. El objetivo de esta etapa era comprobar si las redes reconocían un evento diferente.
+
+```{python}
+#| label: tabla-test-final
+#| echo: true
+columnas = ['familia', 'average_precision_test', 'precision_test', 'recall_test', 'f1_test', 'FP', 'FN']
+tabla(prueba[columnas].rename(columns={
+    'familia': 'Modelo', 'average_precision_test': 'AP prueba',
+    'precision_test': 'Precisión', 'recall_test': 'Recall',
+    'f1_test': 'F1', 'FP': 'Falsas alarmas', 'FN': 'Fallas no detectadas'
+}))
+```
+
+**Resultado:** ninguno de los modelos detectó las 26 ventanas de falla. MLP y LSTM no produjeron falsas alarmas; CNN produjo tres. Aunque la LSTM conservó el mayor AP en prueba (**0,2843**), su **recall fue cero** con el umbral congelado, igual que en las otras dos redes. Por tanto, ninguno de los tres es apto todavía para generar alarmas industriales.
+
+## Matrices de confusión
+
+La matriz de confusión muestra cuántas veces una predicción coincidió con la realidad. Aquí destaca la casilla de fallas reales clasificadas como normales: **26 en cada modelo**.
+
+```{python}
+#| label: confusion-final
+#| fig-cap: 'Matrices de confusión finales; filas = realidad, columnas = predicción'
+#| echo: true
+for _, r in prueba.iterrows():
+    fp, fn = int(r['FP']), int(r['FN'])
+    tn, tp = 7309 - fp, 26 - fn
+    matriz = np.array([[tn, fp], [fn, tp]])
+    fig, ax = plt.subplots(figsize=(4.8, 3.7))
+    ax.imshow(np.log1p(matriz), cmap='Blues')
+    ax.set_xticks([0, 1], ['Normal', 'Falla'])
+    ax.set_yticks([0, 1], ['Normal', 'Falla'])
+    ax.set(xlabel='Predicción', ylabel='Realidad', title=r['familia'])
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, str(matriz[i, j]), ha='center', va='center', fontsize=12)
+    plt.tight_layout(); plt.show()
+```
+
+## Puntajes de los modelos en prueba
+
+El siguiente gráfico permite ver **qué tan lejos quedaron los puntajes de falla del umbral original**. La línea punteada es el límite que el modelo debía superar para declarar una falla. Este análisis es diagnóstico; no cambié los umbrales después de conocer la prueba.
+
+```{python}
+#| label: puntuaciones-test-final
+#| fig-cap: 'Distribución de puntajes por clase real en la Falla 4 y períodos normales de prueba'
+#| echo: true
+for _, fila in prueba.iterrows():
+    familia = fila['familia']
+    ruta = RUTA_TEST / f'predicciones_{familia}.csv'
+    if not ruta.exists():
+        print('Archivo de predicciones no disponible:', ruta.name)
+        continue
+    d = pd.read_csv(ruta)
+    if not {'real', 'puntuacion'}.issubset(d.columns):
+        print('Columnas no reconocidas en', ruta.name)
+        continue
+    normales = d.loc[d.real == 0, 'puntuacion'].clip(lower=1e-8)
+    fallas = d.loc[d.real == 1, 'puntuacion'].clip(lower=1e-8)
+    fig, ax = plt.subplots(figsize=(7.3, 4))
+    ax.boxplot([normales, fallas], tick_labels=['Normal', 'Falla'], showfliers=False)
+    ax.set_yscale('log')
+    ax.axhline(float(fila['umbral_validacion']), linestyle='--',
+               color='#be573b', label='Umbral fijado en validación')
+    ax.set(ylabel='Puntaje de falla (escala logarítmica)', title=familia)
+    ax.legend(); ax.grid(axis='y', alpha=.2)
+    plt.tight_layout(); plt.show()
+```
+
+# Explicación de resultados y limitaciones
+
+## Importancia de los sensores
+
+Para entender qué señales utilizaban más las redes, se alteró **un sensor a la vez** entre ventanas de validación. Si el AP disminuye mucho, el modelo era sensible a esa señal. En las tres arquitecturas destacó **`DV_pressure`**.
+
+```{python}
+#| label: importancia-final
+#| fig-cap: 'Cinco sensores de mayor importancia por permutación para cada arquitectura'
+#| echo: true
+for familia, grupo in importancias.groupby('modelo'):
+    top = grupo.nlargest(5, 'importancia_media').sort_values('importancia_media')
+    fig, ax = plt.subplots(figsize=(7, 3.3))
+    ax.barh(top['sensor'], top['importancia_media'], color='#2473a6')
+    ax.set(xlabel='Disminución de AP al alterar el sensor', title=familia)
+    ax.grid(axis='x', alpha=.2)
+    plt.tight_layout(); plt.show()
+```
+
+## Diferencia entre los cuatro eventos
+
+Las primeras tres fallas tuvieron `DV_pressure` medio cercano a **2**, pero la Falla 4 tuvo un valor cercano a **0**, parecido a los períodos normales. Aun así, las cuatro fallas compartieron principalmente el estado digital `COMP=0`, `DV_eletric=1` y `MPG=0`. Esto muestra una diferencia entre eventos que no se explica solo por el estado de esos controles.
+
+```{python}
+#| label: presion-eventos-final
+#| fig-cap: 'Media de DV_pressure durante los cuatro eventos de fuga de aire'
+#| echo: true
+fallas = auditoria[auditoria.grupo.str.startswith('Falla_')].copy()
+fig, ax = plt.subplots(figsize=(7.5, 4))
+ax.bar(fallas['grupo'], fallas['DV_pressure_media'], color='#2473a6')
+ax.axhline(0, color='#777', linewidth=1)
+ax.set(xlabel='Evento', ylabel='Presión media (valor original)')
+ax.grid(axis='y', alpha=.2)
+plt.tight_layout(); plt.show()
+```
+
+## Prueba adicional: retirar DV_pressure
+
+Después de observar los resultados originales se entrenaron **tres modelos exploratorios sin `DV_pressure`**, usando los otros 14 sensores. El objetivo era medir cuánto dependían de esa señal, no reemplazar la evaluación final.
+
+```{python}
+#| label: ablacion-final
+#| fig-cap: 'Average Precision original y sin DV_pressure en validación'
+#| echo: true
+x = np.arange(len(ablacion))
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(x-.2, ablacion['ap_original_15_sensores'], .4, label='15 sensores')
+ax.bar(x+.2, ablacion['average_precision'], .4, label='14 sensores')
+ax.set_xticks(x, ablacion['modelo'])
+ax.set(ylim=(0,1.05), ylabel='Average Precision en validación')
+ax.legend(); ax.grid(axis='y', alpha=.2)
+plt.tight_layout(); plt.show()
+```
+
+Al excluir `DV_pressure`, el AP de MLP cayó a **0,3371**, el de CNN a **0,5823** y el de LSTM a **0,4508**. Esto refuerza la dependencia del sensor en validación, aunque no demuestra que sea la única causa del resultado observado en prueba. Como el experimento se realizó después de consultar el test original, su interpretación es **exploratoria**.
+
+# Conclusiones
+
+Comparé tres arquitecturas y 15 configuraciones sobre un conjunto de datos industrial real. La LSTM tuvo el mejor Average Precision en validación, pero **ninguna de las tres redes detectó las 26 ventanas de falla del evento de prueba con su umbral original**. Los análisis posteriores mostraron que `DV_pressure` era una señal especialmente influyente y que se comportaba de manera distinta durante la cuarta fuga.
+
+El principal resultado del proyecto es que un buen desempeño sobre una falla conocida en validación **no asegura reconocer una avería futura con características diferentes**. Una mejora real requeriría más eventos independientes y una nueva evaluación sin utilizar datos previamente consultados para ajustar el sistema.
+
+# Reproducibilidad y fuente de datos
+
+El documento se construye a partir de los resultados guardados por los scripts de `02_exploracion/`, `03_preprocesamiento/`, `05_experimentos/` y `07_explicabilidad/`. Las tablas y figuras se recalculan desde los CSV y matrices del proyecto. Los scripts son necesarios para reproducir desde cero la creación de etiquetas, las ventanas y el entrenamiento de las 15 configuraciones; este Quarto **no los reentrena al renderizar** para conservar los experimentos originales.
+
+**Dataset:** Davari, N., Veloso, B., Ribeiro, R. y Gama, J. (2021). *MetroPT-3 Dataset*. UCI Machine Learning Repository. DOI: [10.24432/C5VW3R](https://doi.org/10.24432/C5VW3R). Archivo público: [MetroPT-3](https://archive.ics.uci.edu/dataset/791/metropt+3+dataset).
+
+**Evidencia local requerida:** `01_datos/procesados/`, `06_resultados/metricas/` y `08_portafolio/datos/`.

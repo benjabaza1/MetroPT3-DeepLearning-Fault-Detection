@@ -1,0 +1,23 @@
+# Entornos virtuales
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Datos originales y archivos procesados
+01_datos/original/
+01_datos/procesados/
+
+# Archivos grandes de modelos o datos
+*.npy
+*.npz
+
+# Archivos temporales de Quarto
+.quarto/
+*_files/
+.ipynb_checkpoints/
+*.quarto_ipynb
+
+# Archivos temporales
+.DS_Store
+Thumbs.db

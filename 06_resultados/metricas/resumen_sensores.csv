@@ -1,0 +1,16 @@
+Sensor,Tipo,Minimo,Maximo
+TP2,Analogico,-0.032,10.676
+TP3,Analogico,0.7300000000000004,10.302
+H1,Analogico,-0.0360000000000013,10.288
+DV_pressure,Analogico,-0.032,9.844
+Reservoirs,Analogico,0.7119999999999997,10.3
+Oil_temperature,Analogico,15.400000000000006,89.05000000000001
+Motor_current,Analogico,0.0199999999999995,9.295
+COMP,Digital,0.0,1.0
+DV_eletric,Digital,0.0,1.0
+Towers,Digital,0.0,1.0
+MPG,Digital,0.0,1.0
+LPS,Digital,0.0,1.0
+Pressure_switch,Digital,0.0,1.0
+Oil_level,Digital,0.0,1.0
+Caudal_impulses,Digital,0.0,1.0

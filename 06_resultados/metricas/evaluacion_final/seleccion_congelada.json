@@ -1,0 +1,17 @@
+[
+    {
+        "familia": "MLP",
+        "modelo": "MLP_04_Tanh",
+        "umbral": 0.9829450249671936
+    },
+    {
+        "familia": "CNN_1D",
+        "modelo": "CNN_05_Tanh",
+        "umbral": 0.048883020877838135
+    },
+    {
+        "familia": "LSTM",
+        "modelo": "LSTM_01_Base",
+        "umbral": 0.6298224925994873
+    }
+]
